@@ -224,25 +224,48 @@ async def process_broadcast(message: types.Message, state: FSMContext):
     target = data.get("broadcast_target")
     
     await state.set_state(None)
-    await message.answer("⏳ Broadcast starting...")
     
-    # Check if we are broadcasting globally or to a specific channel
+    # 1. Fetch users from Database
     if target == "ALL":
         cursor = users_collection.find({}, {"_id": 1})
     else:
         cursor = users_collection.find({"joined_chats": target}, {"_id": 1})
         
-    success_count = 0
+    users_list = await cursor.to_list(length=None)
+    total_users = len(users_list)
     
-    async for user_doc in cursor:
+    # 2. Check if Database is empty
+    if total_users == 0:
+        await message.answer(
+            "⚠️ **Database Empty:** I found 0 users for this specific channel.\n"
+            "*(If these users were in the queue from an older version of the bot, they may not be tagged with this channel ID yet).* ",
+            parse_mode="Markdown"
+        )
+        return
+
+    await message.answer(f"⏳ Broadcast starting... Attempting to send to {total_users} users.")
+    
+    success_count = 0
+    fail_count = 0
+    
+    # 3. Execute Broadcast
+    for user_doc in users_list:
         try:
             await message.copy_to(chat_id=user_doc["_id"])
             success_count += 1
             await asyncio.sleep(0.05) 
-        except Exception:
-            pass 
+        except Exception as e:
+            fail_count += 1
+            print(f"Failed to send to {user_doc['_id']}: {e}")
 
-    await message.answer(f"✅ Broadcast finished! Delivered to **{success_count}** users.", parse_mode="Markdown")
+    # 4. Final Diagnostic Report
+    report = (
+        f"✅ **Broadcast Finished!**\n\n"
+        f"🎯 **Delivered:** {success_count}\n"
+        f"❌ **Failed:** {fail_count} *(User blocked bot or strict privacy settings)*\n"
+        f"📊 **Total in DB for this Chat:** {total_users}"
+    )
+    await message.answer(report, parse_mode="Markdown")
 
 # ==========================================
 # QUEUE CLEARANCE LOGIC
