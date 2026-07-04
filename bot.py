@@ -36,8 +36,8 @@ class BotConfigState(StatesGroup):
 
 def get_suggestion_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Join our Backup Channel", url="https://t.me/your_backup")],
-        [InlineKeyboardButton(text="Join our Discussion Group", url="https://t.me/your_group")]
+        [InlineKeyboardButton(text="Join our Backup Channel", url="https://t.me/Vk_Devss")],
+        [InlineKeyboardButton(text="Support", url="https://t.me/Vk_Devz")]
     ])
 
 # Helper to verify active connection
