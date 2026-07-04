@@ -287,7 +287,7 @@ async def process_queue_clearance(message: types.Message, chat_id: int):
         first_name = user_doc.get("first_name", "User")
         
         try:
-            default_msg = f"Hello {first_name}! Your request to join was approved. Welcome! 🎉"
+            default_msg = f"Hello {first_name}! Your request to join was approved. Welcome! 🎉 click /start"
             welcome_text = channel_data.get("welcome_message", default_msg) if channel_data else default_msg
             
             await bot.send_message(chat_id=user_id, text=welcome_text, reply_markup=get_suggestion_keyboard())
