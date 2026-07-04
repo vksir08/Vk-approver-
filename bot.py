@@ -16,6 +16,8 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MONGO_URI = os.environ.get("MONGO_URI")
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL")
 
+BOT_OWNER_ID = int(os.environ.get("BOT_OWNER_ID", 0))
+
 client = AsyncIOMotorClient(MONGO_URI)
 db = client["telegram_bot_db"]
 users_collection = db["users"]             
@@ -192,19 +194,44 @@ async def process_welcome_text(message: types.Message, state: FSMContext):
         await state.set_state(None)
 
 # ==========================================
-# BROADCAST SYSTEM
+# BROADCAST SYSTEM (CHANNEL SPECIFIC & GLOBAL)
 # ==========================================
 @dp.message(Command("broadcast"))
 async def cmd_broadcast(message: types.Message, state: FSMContext):
-    await message.answer("📢 Send the message you want to broadcast to all accepted users (Text, Photo, etc.):")
+    """Admin command to broadcast to the currently connected chat."""
+    chat_id = await get_current_chat(message, state)
+    if not chat_id:
+        return
+        
+    await message.answer(f"📢 Send the message you want to broadcast to members of the connected chat (`{chat_id}`):")
+    await state.update_data(broadcast_target=chat_id)
+    await state.set_state(BotConfigState.waiting_for_broadcast)
+
+@dp.message(Command("broadcast_all"))
+async def cmd_broadcast_all(message: types.Message, state: FSMContext):
+    """Owner-only command to broadcast globally across all databases."""
+    if message.from_user.id != BOT_OWNER_ID:
+        await message.answer("❌ **Permission Denied.** Only the Bot Owner can broadcast globally.")
+        return
+        
+    await message.answer("⚠️ **[GLOBAL BROADCAST]** ⚠️\nSend the message you want to broadcast to ALL accepted users across ALL channels:")
+    await state.update_data(broadcast_target="ALL")
     await state.set_state(BotConfigState.waiting_for_broadcast)
 
 @dp.message(BotConfigState.waiting_for_broadcast)
 async def process_broadcast(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    target = data.get("broadcast_target")
+    
     await state.set_state(None)
     await message.answer("⏳ Broadcast starting...")
     
-    cursor = users_collection.find({}, {"_id": 1})
+    # Check if we are broadcasting globally or to a specific channel
+    if target == "ALL":
+        cursor = users_collection.find({}, {"_id": 1})
+    else:
+        cursor = users_collection.find({"joined_chats": target}, {"_id": 1})
+        
     success_count = 0
     
     async for user_doc in cursor:
@@ -245,7 +272,15 @@ async def process_queue_clearance(message: types.Message, chat_id: int):
             
             success_count += 1
             await pending_collection.delete_one({"_id": user_doc["_id"]})
-            await users_collection.update_one({"_id": user_id}, {"$set": {"first_name": first_name}}, upsert=True)
+            # Move from pending DB to accepted DB, appending the chat_id
+            await users_collection.update_one(
+                {"_id": user_id}, 
+                {
+                    "$set": {"first_name": first_name},
+                    "$addToSet": {"joined_chats": chat_id} # <--- THIS IS THE 3RD POINT
+                }, 
+                upsert=True
+            )
             await asyncio.sleep(0.05) 
             
         except Exception:
@@ -283,7 +318,15 @@ async def handle_join_request(update: types.ChatJoinRequest):
         await bot.send_message(chat_id=user_id, text=welcome_text, reply_markup=get_suggestion_keyboard())
         await bot.approve_chat_join_request(chat_id=chat_id, user_id=user_id)
         
-        asyncio.create_task(users_collection.update_one({"_id": user_id}, {"$set": {"first_name": first_name}}, upsert=True))
+        # Update user record with their name and add the channel ID to their "joined_chats" list
+        asyncio.create_task(users_collection.update_one(
+            {"_id": user_id}, 
+            {
+                "$set": {"first_name": first_name},
+                "$addToSet": {"joined_chats": chat_id} # <--- THIS IS THE 3RD POINT
+            }, 
+            upsert=True
+        ))
         asyncio.create_task(channels_collection.update_one({"_id": chat_id}, {"$inc": {"accepted_count": 1}}, upsert=True))
     except Exception as e:
         print(f"Error handling high-speed request for {user_id}: {e}")
