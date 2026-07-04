@@ -15,8 +15,8 @@ from motor.motor_asyncio import AsyncIOMotorClient
 # CONFIGURATION
 # ==========================================
 # Load secrets from the cloud environment (Render Environment Variables)
-BOT_TOKEN = '8689246254:AAGxwjqpdUdN_-jefP9PjvLzCKVYIugttV0'
-MONGO_URI = "mongodb+srv://vikkixsir1221_db_user:14HtD8cv0SWYC835@cluster0.s1dnbig.mongodb.net/?appName=Cluster0"
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+MONGO_URI = os.environ.get("MONGO_URI")
 
 # Database Initialization
 client = AsyncIOMotorClient(MONGO_URI)
