@@ -78,6 +78,61 @@ async def cmd_help(message: types.Message):
     )
     await message.answer(help_text, parse_mode="Markdown")
 
+@dp.message(Command("groupstats"))
+async def cmd_groupstats(message: types.Message):
+    # 1. Block anyone who isn't the owner
+    if message.from_user.id != BOT_OWNER_ID:
+        await message.answer("❌ **Permission Denied.** Only the Bot Owner can view global statistics.")
+        return
+
+    loading_msg = await message.answer("📊 Fetching network statistics from the database...")
+    
+    # 2. Pull all connected chats from MongoDB
+    cursor = channels_collection.find({})
+    channels = await cursor.to_list(length=None)
+    
+    if not channels:
+        await loading_msg.edit_text("⚠️ No groups or channels are currently connected to the database.")
+        return
+
+    # 3. Build the Master Report
+    stats_message = "🌐 **Global Network Statistics** 🌐\n\n"
+    
+    for chat in channels:
+        chat_id = chat["_id"]
+        chat_title = chat.get("title", "Unknown Chat (Reconnect to fix)")
+        is_active = chat.get("is_active", True)
+        
+        # Format the limit nicely
+        raw_limit = chat.get("limit", float('inf'))
+        limit_display = "∞" if raw_limit == float('inf') else str(raw_limit)
+        
+        accepted = chat.get("accepted_count", 0)
+        
+        # Count how many users are waiting in the queue specifically for this chat
+        pending_count = await pending_collection.count_documents({"chat_id": chat_id})
+        
+        status_icon = "🟢 ACTIVE (Auto-Accepting)" if is_active else "🔴 PAUSED (Routing to Queue)"
+        
+        stats_message += (
+            f"🏷 **{chat_title}**\n"
+            f"🆔 `{chat_id}`\n"
+            f"⚙️ Status: {status_icon}\n"
+            f"👥 Accepted Users: {accepted} / {limit_display}\n"
+            f"⏳ Waiting in Queue: {pending_count}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+        )
+        
+    # 4. Safe Delivery (Handles Telegram's 4096 character limit for massive networks)
+    await loading_msg.delete()
+    
+    if len(stats_message) <= 4000:
+        await message.answer(stats_message, parse_mode="Markdown")
+    else:
+        # If the text is too long, split it into multiple messages
+        for x in range(0, len(stats_message), 4000):
+            await message.answer(stats_message[x:x+4000], parse_mode="Markdown")
+
 @dp.message(Command("connect"))
 async def cmd_connect(message: types.Message, command: CommandObject, state: FSMContext):
     if not command.args:
@@ -92,15 +147,23 @@ async def cmd_connect(message: types.Message, command: CommandObject, state: FSM
             await message.answer("⚠️ Bot is not an administrator in that chat. Please add me as an admin first!")
             return
 
+        # Fetch the actual name of the channel/group from Telegram
+        chat_info = await bot.get_chat(chat_id)
+        chat_title = chat_info.title or "Unknown Chat"
+
+        # Save the chat setup AND the title to the database
         await channels_collection.update_one(
             {"_id": chat_id},
-            {"$setOnInsert": {"is_active": True, "limit": float('inf'), "accepted_count": 0}},
+            {
+                "$setOnInsert": {"is_active": True, "limit": float('inf'), "accepted_count": 0},
+                "$set": {"title": chat_title}
+            },
             upsert=True
         )
         
         await state.update_data(connected_chat_id=chat_id)
         await message.answer(
-            f"✅ **Connected Successfully!**\nTarget Chat ID: `{chat_id}`\n\n"
+            f"✅ **Connected Successfully!**\nTarget Chat: **{chat_title}** (`{chat_id}`)\n\n"
             "Now you can manage this chat using the control commands.",
             parse_mode="Markdown"
         )
@@ -110,12 +173,22 @@ async def cmd_connect(message: types.Message, command: CommandObject, state: FSM
 # ==========================================
 # CONTROL SETTINGS
 # ==========================================
-@dp.message(Command("approve_on"))
-async def cmd_approve_on(message: types.Message, state: FSMContext):
+@dp.message(Command("approved"))
+async def cmd_approved(message: types.Message, command: CommandObject, state: FSMContext):
     chat_id = await get_current_chat(message, state)
-    if chat_id:
-        await channels_collection.update_one({"_id": chat_id}, {"$set": {"is_active": True}}, upsert=True)
-        await message.answer("✅ Live Auto-Accept turned **ON** for the active chat.")
+    if not chat_id:
+        return
+
+    if command.args:
+        try:
+            limit = int(command.args.strip())
+            await channels_collection.update_one({"_id": chat_id}, {"$set": {"limit": limit}}, upsert=True)
+            await message.answer(f"✅ Auto-accept limit set directly to **{limit}** members.")
+        except ValueError:
+            await message.answer("⚠️ Please provide a valid number. Example: `/approved 50`")
+    else:
+        # RUN IN BACKGROUND: Prevents the server from crashing on massive queues!
+        asyncio.create_task(process_queue_clearance(message, chat_id))
 
 @dp.message(Command("approve_off"))
 async def cmd_approve_off(message: types.Message, state: FSMContext):
@@ -268,7 +341,7 @@ async def process_broadcast(message: types.Message, state: FSMContext):
     await message.answer(report, parse_mode="Markdown")
 
 # ==========================================
-# QUEUE CLEARANCE LOGIC
+# BACKGROUND QUEUE CLEARANCE LOGIC
 # ==========================================
 async def process_queue_clearance(message: types.Message, chat_id: int):
     cursor = pending_collection.find({"chat_id": chat_id})
@@ -278,16 +351,24 @@ async def process_queue_clearance(message: types.Message, chat_id: int):
         await message.answer("📭 There are no pending requests in the database queue for this chat.")
         return
 
-    await message.answer(f"⏳ Approving **{len(pending_users)}** users from the queue...", parse_mode="Markdown")
+    # Notify admin that the background task has successfully started
+    await message.answer(
+        f"⏳ **Background Task Started!**\n"
+        f"Approving **{len(pending_users)}** users from the queue...\n"
+        f"*(This may take a few minutes for large queues. I will DM you when it is 100% complete!)*", 
+        parse_mode="Markdown"
+    )
+    
     channel_data = await channels_collection.find_one({"_id": chat_id})
     success_count = 0
+    fail_count = 0
     
     for user_doc in pending_users:
         user_id = user_doc["user_id"]
         first_name = user_doc.get("first_name", "User")
         
         try:
-            default_msg = f"Hello {first_name}! Your request to join was approved. Welcome! 🎉 click /start"
+            default_msg = f"Hello {first_name}! Your request to join was approved. Welcome! 🎉"
             welcome_text = channel_data.get("welcome_message", default_msg) if channel_data else default_msg
             
             await bot.send_message(chat_id=user_id, text=welcome_text, reply_markup=get_suggestion_keyboard())
@@ -295,22 +376,34 @@ async def process_queue_clearance(message: types.Message, chat_id: int):
             
             success_count += 1
             await pending_collection.delete_one({"_id": user_doc["_id"]})
-            # Move from pending DB to accepted DB, appending the chat_id
+            
+            # Move from pending DB to accepted DB
             await users_collection.update_one(
                 {"_id": user_id}, 
                 {
                     "$set": {"first_name": first_name},
-                    "$addToSet": {"joined_chats": chat_id} # <--- THIS IS THE 3RD POINT
+                    "$addToSet": {"joined_chats": chat_id}
                 }, 
                 upsert=True
             )
-            await asyncio.sleep(0.05) 
-            
-        except Exception:
+        except Exception as e:
+            fail_count += 1
+            # Even if it fails, delete from pending so the bot never gets stuck on a broken user
             await pending_collection.delete_one({"_id": user_doc["_id"]})
+            
+        # Mandatory speed limit to keep Telegram happy (20 actions per second)
+        await asyncio.sleep(0.05) 
 
+    # Final database update and Admin notification
     await channels_collection.update_one({"_id": chat_id}, {"$inc": {"accepted_count": success_count}}, upsert=True)
-    await message.answer(f"✅ Cleared queue! Successfully approved **{success_count}/{len(pending_users)}** users.", parse_mode="Markdown")
+    
+    await message.answer(
+        f"✅ **Queue Clearance Complete!**\n\n"
+        f"🎯 **Successfully Approved:** {success_count}\n"
+        f"❌ **Failed:** {fail_count} *(Users deleted their account or blocked the bot while waiting)*\n\n"
+        f"All successful users have been permanently added to the broadcasting database.", 
+        parse_mode="Markdown"
+    )
 
 # ==========================================
 # HIGH-SPEED JOIN REQUEST & MANDATORY DM
