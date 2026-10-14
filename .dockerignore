@@ -1,0 +1,10 @@
+__pycache__
+*.pyc
+.git
+.gitignore
+*.md
+build.sh
+Procfile
+runtime.txt
+Pipfile
+Pipfile.lock
