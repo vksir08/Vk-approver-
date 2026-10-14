@@ -1,9 +1,6 @@
 """
-╔══════════════════════════════════════════════════════════════╗
-║            ⚡ AutoAccept Pro — Telegram Bot ⚡                ║
-║     High-Speed Join Request Auto-Acceptor + Webhooks         ║
-║              Optimized for Render Deployment                  ║
-╚══════════════════════════════════════════════════════════════╝
+⚡ AutoAccept Pro — Telegram Join Request Bot
+Deploy on Render with Webhooks + MongoDB
 """
 
 import os
@@ -11,24 +8,30 @@ import json
 import asyncio
 import logging
 import time
+import tempfile
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import (
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery,
+    FSInputFile,
+)
 from aiogram.filters.callback_data import CallbackData
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from motor.motor_asyncio import AsyncIOMotorClient
 
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 # LOGGING
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-7s | %(message)s",
@@ -36,9 +39,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("AutoAcceptPro")
 
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 # CONFIGURATION
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "")
 MONGO_URI: str = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
 BASE_URL: str = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
@@ -51,42 +54,38 @@ if not BOT_TOKEN:
     logger.critical("BOT_TOKEN is not set! Exiting.")
     raise SystemExit(1)
 if not BASE_URL:
-    logger.warning("RENDER_EXTERNAL_URL not set — webhook will fail on deploy.")
+    logger.warning("RENDER_EXTERNAL_URL not set — webhook may fail.")
 
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 # DATABASE
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db = mongo_client["autoaccept_pro"]
-channels_col = db["channels"]       # per-channel config
-users_col = db["users"]             # accepted users
-queue_col = db["queue"]             # pending join requests
-blacklist_col = db["blacklist"]     # blacklisted users
-logs_col = db["audit_logs"]         # audit log entries
+channels_col = db["channels"]
+users_col = db["users"]
+queue_col = db["queue"]
+blacklist_col = db["blacklist"]
+logs_col = db["audit_logs"]
 
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 # BOT & DISPATCHER
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 
-# ──────────────────────────────────────────
+
+# ──────────────────────────────────────────────
 # CALLBACK DATA FACTORIES
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 class ConfirmCb(CallbackData, prefix="cf"):
-    """Queue spot confirmation button."""
-    cid: int   # chat_id
-    uid: int   # user_id
+    cid: int
+    uid: int
 
-class PageCb(CallbackData, prefix="pg"):
-    """Pagination button."""
-    act: str   # action key
-    n: int     # page number
 
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 # FSM STATES
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 class S(StatesGroup):
     limit = State()
     welcome = State()
@@ -95,126 +94,128 @@ class S(StatesGroup):
     log_channel = State()
     expiry = State()
 
-# ──────────────────────────────────────────
+
+# ──────────────────────────────────────────────
 # KEYBOARDS
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 def default_welcome_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📦 Backup Channel", url=f"https://t.me/{BACKUP_CHANNEL}")],
-        [InlineKeyboardButton(text="🛠 Support", url=f"https://t.me/{SUPPORT_USER}")],
-    ])
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📦 Backup Channel", url=f"https://t.me/{BACKUP_CHANNEL}")],
+            [InlineKeyboardButton(text="🛠 Support", url=f"https://t.me/{SUPPORT_USER}")],
+        ]
+    )
+
 
 def confirm_spot_kb(chat_id: int, user_id: int) -> InlineKeyboardMarkup:
     payload = ConfirmCb(cid=chat_id, uid=user_id).pack()
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Confirm My Spot", callback_data=payload)],
-    ])
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Confirm My Spot", callback_data=payload)],
+        ]
+    )
+
 
 def force_sub_kb(title: str, username: Optional[str], chat_id: int) -> InlineKeyboardMarkup:
     if username:
         url = f"https://t.me/{username}"
     else:
-        # For private channels, use invite link approach
         url = f"https://t.me/c/{str(chat_id)[4:]}"
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"🔗 Join {title}", url=url)],
-    ])
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"🔗 Join {title}", url=url)],
+        ]
+    )
 
-# ──────────────────────────────────────────
+
+# ──────────────────────────────────────────────
 # TEMPLATE ENGINE
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 def render_template(template: str, **kw) -> str:
-    """Replace {var} placeholders safely — unknown keys are left as-is."""
     result = template
     for key, val in kw.items():
         result = result.replace(f"{{{key}}}", str(val))
     return result
 
+
 def default_welcome_text(name: str) -> str:
     return f"🎉 Hello <b>{name}</b>!\n\nYour join request has been <b>approved</b>. Welcome aboard!"
 
-# ──────────────────────────────────────────
+
+# ──────────────────────────────────────────────
 # HELPERS
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 async def get_chat(state: FSMContext) -> Optional[int]:
-    """Return the admin's currently-connected chat_id or None."""
     data = await state.get_data()
     return data.get("connected_chat_id")
 
+
 async def require_chat(message: types.Message, state: FSMContext) -> Optional[int]:
-    """Get connected chat or warn the admin."""
     cid = await get_chat(state)
     if not cid:
         await message.answer("⚠️ No chat connected. Use <code>/connect &lt;chat_id&gt;</code> first.")
     return cid
 
+
 def is_owner(user_id: int) -> bool:
     return user_id == OWNER_ID
 
-async def is_channel_admin(chat_id: int, user_id: int) -> bool:
-    """Check if user_id is in the channel's admin list OR is the bot owner."""
-    if is_owner(user_id):
-        return True
-    doc = await channels_col.find_one({"_id": chat_id}, {"admins": 1})
-    if doc and user_id in doc.get("admins", []):
-        return True
-    return False
 
 async def is_blacklisted(user_id: int) -> bool:
     return await blacklist_col.find_one({"_id": user_id}) is not None
 
+
 async def log_event(chat_id: int, event: str, user_id: int, detail: str = ""):
-    """Write an audit log entry and optionally forward to the log channel."""
-    entry = {
-        "chat_id": chat_id,
-        "event": event,
-        "user_id": user_id,
-        "detail": detail,
-        "ts": datetime.utcnow(),
-    }
-    await logs_col.insert_one(entry)
-    # Forward to logging channel if configured
-    ch = await channels_col.find_one({"_id": chat_id}, {"log_channel": 1})
-    log_ch = ch.get("log_channel") if ch else None
-    if log_ch:
-        try:
-            await bot.send_message(
-                chat_id=log_ch,
-                text=f"📋 <b>{event}</b>\n👤 User: <code>{user_id}</code>\n💬 {detail}",
-            )
-        except Exception:
-            pass
+    try:
+        entry = {
+            "chat_id": chat_id,
+            "event": event,
+            "user_id": user_id,
+            "detail": detail,
+            "ts": datetime.utcnow(),
+        }
+        await logs_col.insert_one(entry)
+        ch = await channels_col.find_one({"_id": chat_id}, {"log_channel": 1})
+        log_ch = ch.get("log_channel", 0) if ch else 0
+        if log_ch:
+            try:
+                await bot.send_message(
+                    chat_id=log_ch,
+                    text=f"📋 <b>{event}</b>\n👤 User: <code>{user_id}</code>\n💬 {detail}",
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 
 async def get_or_create_channel(chat_id: int) -> dict:
-    """Return channel config, creating with defaults if new."""
+    doc = await channels_col.find_one({"_id": chat_id})
+    if doc:
+        return doc
     defaults = {
+        "_id": chat_id,
         "is_active": True,
-        "limit": 0,            # 0 = unlimited
+        "limit": 0,
         "accepted_count": 0,
         "welcome_message": "",
         "force_sub": 0,
         "log_channel": 0,
-        "expiry_hours": 0,     # 0 = never expire
+        "expiry_hours": 0,
         "admins": [],
         "title": "",
     }
-    doc = await channels_col.find_one_and_update(
-        {"_id": chat_id},
-        {"$setOnInsert": defaults},
-        upsert=True,
-        return_document=True,  # need pymongo option; fallback below
-    )
-    # motor may not support return_document well; simple fallback:
-    if doc is None:
-        doc = await channels_col.find_one({"_id": chat_id})
-    return doc
+    await channels_col.insert_one(defaults)
+    return defaults
+
 
 def limit_display(limit: int) -> str:
     return "∞" if limit == 0 else str(limit)
 
-# ──────────────────────────────────────────
+
+# ──────────────────────────────────────────────
 # 1. CORE COMMANDS
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     await message.answer(
@@ -224,11 +225,11 @@ async def cmd_start(message: types.Message):
         "🔹 Quick start: <code>/connect -100xxxxxxxxxx</code>"
     )
 
+
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
-    is_me = is_owner(message.from_user.id)
     txt = (
-        "⚙️ <b>Commands — Channel Management</b>\n"
+        "⚙️ <b>Channel Management</b>\n"
         "├ /connect <code>ID</code> — Link a channel/group\n"
         "├ /disconnect — Unlink current session\n"
         "├ /remove — Delete channel from bot DB\n"
@@ -257,7 +258,7 @@ async def cmd_help(message: types.Message):
         "├ /stats — Connected chat statistics\n"
         "├ /export — Export accepted users as JSON\n"
     )
-    if is_me:
+    if is_owner(message.from_user.id):
         txt += (
             "\n👑 <b>Owner-Only</b>\n"
             "├ /broadcast_all — DM every user in DB\n"
@@ -266,9 +267,10 @@ async def cmd_help(message: types.Message):
         )
     await message.answer(txt)
 
-# ──────────────────────────────────────────
+
+# ──────────────────────────────────────────────
 # 2. CHANNEL MANAGEMENT
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 @dp.message(Command("connect"))
 async def cmd_connect(message: types.Message, command: CommandObject, state: FSMContext):
     if not command.args:
@@ -292,18 +294,20 @@ async def cmd_connect(message: types.Message, command: CommandObject, state: FSM
         if existing:
             await channels_col.update_one({"_id": chat_id}, {"$set": {"title": title}})
         else:
-            await channels_col.insert_one({
-                "_id": chat_id,
-                "title": title,
-                "is_active": True,
-                "limit": 0,
-                "accepted_count": 0,
-                "welcome_message": "",
-                "force_sub": 0,
-                "log_channel": 0,
-                "expiry_hours": 0,
-                "admins": [message.from_user.id],
-            })
+            await channels_col.insert_one(
+                {
+                    "_id": chat_id,
+                    "title": title,
+                    "is_active": True,
+                    "limit": 0,
+                    "accepted_count": 0,
+                    "welcome_message": "",
+                    "force_sub": 0,
+                    "log_channel": 0,
+                    "expiry_hours": 0,
+                    "admins": [message.from_user.id],
+                }
+            )
 
         await state.update_data(connected_chat_id=chat_id)
         await message.answer(
@@ -313,14 +317,16 @@ async def cmd_connect(message: types.Message, command: CommandObject, state: FSM
     except Exception as e:
         await message.answer(f"❌ Connection failed: <code>{e}</code>")
 
+
 @dp.message(Command("disconnect"))
 async def cmd_disconnect(message: types.Message, state: FSMContext):
     cid = await get_chat(state)
     if cid:
         await state.update_data(connected_chat_id=None)
-        await message.answer(f"🔓 Disconnected from <code>{cid}</code>. Session cleared.")
+        await message.answer(f"🔓 Disconnected from <code>{cid}</code>.")
     else:
         await message.answer("⚠️ No chat connected.")
+
 
 @dp.message(Command("remove"))
 async def cmd_remove(message: types.Message, state: FSMContext):
@@ -331,9 +337,10 @@ async def cmd_remove(message: types.Message, state: FSMContext):
     await queue_col.delete_many({"chat_id": cid})
     await state.update_data(connected_chat_id=None)
     if result.deleted_count:
-        await message.answer(f"🗑 Channel <code>{cid}</code> and its queue removed from DB.")
+        await message.answer(f"🗑 Channel <code>{cid}</code> and its queue removed.")
     else:
         await message.answer("⚠️ Channel not found in DB.")
+
 
 @dp.message(Command("channels"))
 async def cmd_channels(message: types.Message):
@@ -345,38 +352,46 @@ async def cmd_channels(message: types.Message):
     txt = "📋 <b>Connected Channels</b>\n\n"
     for c in chats:
         icon = "🟢" if c.get("is_active", True) else "🔴"
-        txt += f"{icon} <b>{c.get('title','?')}</b> — <code>{c['_id']}</code> ({c.get('accepted_count',0)} accepted)\n"
+        txt += f"{icon} <b>{c.get('title', '?')}</b> — <code>{c['_id']}</code> ({c.get('accepted_count', 0)} accepted)\n"
     await message.answer(txt)
 
-# ──────────────────────────────────────────
+
+# ──────────────────────────────────────────────
 # 3. AUTO-ACCEPT SETTINGS
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 @dp.message(Command("approve_on"))
 async def cmd_approve_on(message: types.Message, state: FSMContext):
     cid = await require_chat(message, state)
-    if not cid: return
+    if not cid:
+        return
     await channels_col.update_one({"_id": cid}, {"$set": {"is_active": True}})
     await message.answer("✅ Auto-accept <b>ON</b>.")
+
 
 @dp.message(Command("approve_off"))
 async def cmd_approve_off(message: types.Message, state: FSMContext):
     cid = await require_chat(message, state)
-    if not cid: return
+    if not cid:
+        return
     await channels_col.update_one({"_id": cid}, {"$set": {"is_active": False}})
     await message.answer("🛑 Auto-accept <b>OFF</b> — new users go to queue.")
+
 
 @dp.message(Command("setlimit"))
 async def cmd_setlimit(message: types.Message, state: FSMContext):
     cid = await require_chat(message, state)
-    if not cid: return
+    if not cid:
+        return
     await message.answer("🔢 Send the max number of users to auto-accept (0 = unlimited):")
     await state.set_state(S.limit)
+
 
 @dp.message(S.limit)
 async def proc_limit(message: types.Message, state: FSMContext):
     try:
         val = int(message.text.strip())
-        if val < 0: raise ValueError
+        if val < 0:
+            raise ValueError
     except ValueError:
         await message.answer("⚠️ Enter a valid non-negative number.")
         return
@@ -386,10 +401,12 @@ async def proc_limit(message: types.Message, state: FSMContext):
         await message.answer(f"✅ Limit set to <b>{limit_display(val)}</b>.")
     await state.set_state(None)
 
+
 @dp.message(Command("welcome"))
 async def cmd_welcome(message: types.Message, state: FSMContext):
     cid = await require_chat(message, state)
-    if not cid: return
+    if not cid:
+        return
     if message.reply_to_message:
         text = message.reply_to_message.text or message.reply_to_message.caption or ""
         if not text:
@@ -411,6 +428,7 @@ async def cmd_welcome(message: types.Message, state: FSMContext):
         await message.answer(hint)
         await state.set_state(S.welcome)
 
+
 @dp.message(S.welcome)
 async def proc_welcome(message: types.Message, state: FSMContext):
     cid = await get_chat(state)
@@ -419,15 +437,18 @@ async def proc_welcome(message: types.Message, state: FSMContext):
         await message.answer(f"✅ Welcome message updated!\n\n<code>{message.text[:500]}</code>")
     await state.set_state(None)
 
+
 @dp.message(Command("forcesub"))
 async def cmd_forcesub(message: types.Message, state: FSMContext):
     cid = await require_chat(message, state)
-    if not cid: return
+    if not cid:
+        return
     await message.answer(
         "🔗 Send the Chat ID of the channel users must join first.\n"
         "Send <b>0</b> to disable force-subscribe."
     )
     await state.set_state(S.force_sub)
+
 
 @dp.message(S.force_sub)
 async def proc_forcesub(message: types.Message, state: FSMContext):
@@ -445,33 +466,40 @@ async def proc_forcesub(message: types.Message, state: FSMContext):
             await message.answer(f"✅ Force-subscribe set to <code>{val}</code>.")
     await state.set_state(None)
 
+
 @dp.message(Command("setexpiry"))
 async def cmd_expiry(message: types.Message, state: FSMContext):
     cid = await require_chat(message, state)
-    if not cid: return
+    if not cid:
+        return
     await message.answer("⏱ Send hours after which pending requests auto-reject (0 = never):")
     await state.set_state(S.expiry)
+
 
 @dp.message(S.expiry)
 async def proc_expiry(message: types.Message, state: FSMContext):
     try:
         val = int(message.text.strip())
-        if val < 0: raise ValueError
+        if val < 0:
+            raise ValueError
     except ValueError:
         await message.answer("⚠️ Enter a valid non-negative number.")
         return
     cid = await get_chat(state)
     if cid:
         await channels_col.update_one({"_id": cid}, {"$set": {"expiry_hours": val}})
-        await message.answer(f"✅ Request expiry set to <b>{val}h</b>.")
+        awaitF = message.answer(f"✅ Request expiry set to <b>{val}h</b>.")
     await state.set_state(None)
+
 
 @dp.message(Command("setlog"))
 async def cmd_setlog(message: types.Message, state: FSMContext):
     cid = await require_chat(message, state)
-    if not cid: return
+    if not cid:
+        return
     await message.answer("📋 Send the Chat ID for audit logs (0 to disable):")
     await state.set_state(S.log_channel)
+
 
 @dp.message(S.log_channel)
 async def proc_log_channel(message: types.Message, state: FSMContext):
@@ -486,13 +514,15 @@ async def proc_log_channel(message: types.Message, state: FSMContext):
         await message.answer(f"✅ Log channel set to <code>{val}</code>.")
     await state.set_state(None)
 
-# ──────────────────────────────────────────
+
+# ──────────────────────────────────────────────
 # 4. ADMIN MANAGEMENT
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 @dp.message(Command("addadmin"))
 async def cmd_addadmin(message: types.Message, command: CommandObject, state: FSMContext):
     cid = await require_chat(message, state)
-    if not cid: return
+    if not cid:
+        return
     if not command.args:
         await message.answer("⚠️ Usage: <code>/addadmin USER_ID</code>")
         return
@@ -504,10 +534,12 @@ async def cmd_addadmin(message: types.Message, command: CommandObject, state: FS
     await channels_col.update_one({"_id": cid}, {"$addToSet": {"admins": uid}})
     await message.answer(f"✅ Admin <code>{uid}</code> added.")
 
+
 @dp.message(Command("deladmin"))
 async def cmd_deladmin(message: types.Message, command: CommandObject, state: FSMContext):
     cid = await require_chat(message, state)
-    if not cid: return
+    if not cid:
+        return
     if not command.args:
         await message.answer("⚠️ Usage: <code>/deladmin USER_ID</code>")
         return
@@ -519,10 +551,12 @@ async def cmd_deladmin(message: types.Message, command: CommandObject, state: FS
     await channels_col.update_one({"_id": cid}, {"$pull": {"admins": uid}})
     await message.answer(f"✅ Admin <code>{uid}</code> removed.")
 
+
 @dp.message(Command("admins"))
 async def cmd_admins(message: types.Message, state: FSMContext):
     cid = await require_chat(message, state)
-    if not cid: return
+    if not cid:
+        return
     ch = await channels_col.find_one({"_id": cid}, {"admins": 1})
     admins = ch.get("admins", []) if ch else []
     if not admins:
@@ -538,9 +572,10 @@ async def cmd_admins(message: types.Message, state: FSMContext):
         txt += f"• <code>{OWNER_ID}</code> 👑 (global owner)\n"
     await message.answer(txt)
 
-# ──────────────────────────────────────────
+
+# ──────────────────────────────────────────────
 # 5. BLACKLIST
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 @dp.message(Command("blacklist"))
 async def cmd_blacklist(message: types.Message, command: CommandObject):
     if not is_owner(message.from_user.id):
@@ -554,8 +589,13 @@ async def cmd_blacklist(message: types.Message, command: CommandObject):
     except ValueError:
         await message.answer("❌ Invalid ID.")
         return
-    await blacklist_col.update_one({"_id": uid}, {"$set": {"by": message.from_user.id, "ts": datetime.utcnow()}}, upsert=True)
-    await message.answer(f"🚫 User <code>{uid}</code> blacklisted. They will be auto-rejected.")
+    await blacklist_col.update_one(
+        {"_id": uid},
+        {"$set": {"by": message.from_user.id, "ts": datetime.utcnow()}},
+        upsert=True,
+    )
+    await message.answer(f"🚫 User <code>{uid}</code> blacklisted.")
+
 
 @dp.message(Command("unblacklist"))
 async def cmd_unblacklist(message: types.Message, command: CommandObject):
@@ -573,40 +613,47 @@ async def cmd_unblacklist(message: types.Message, command: CommandObject):
     await blacklist_col.delete_one({"_id": uid})
     await message.answer(f"✅ User <code>{uid}</code> unblacklisted.")
 
-# ──────────────────────────────────────────
+
+# ──────────────────────────────────────────────
 # 6. QUEUE MANAGEMENT
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 @dp.message(Command("queue"))
 async def cmd_queue(message: types.Message, state: FSMContext):
     cid = await require_chat(message, state)
-    if not cid: return
+    if not cid:
+        return
     pending = await queue_col.find({"chat_id": cid}).to_list(length=50)
     if not pending:
         await message.answer("📭 Queue is empty.")
         return
     txt = f"⏳ <b>Pending Queue ({len(pending)})</b>\n\n"
     for i, u in enumerate(pending, 1):
-        txt += f"{i}. {u.get('first_name','?')} — <code>{u['user_id']}</code>\n"
+        conf = "✅" if u.get("confirmed") else "⏳"
+        txt += f"{i}. {conf} {u.get('first_name', '?')} — <code>{u['user_id']}</code>\n"
         if i >= 30:
-            txt += f"\n... and {len(pending)-30} more."
+            txt += f"\n... and {len(pending) - 30} more."
             break
     await message.answer(txt)
+
 
 @dp.message(Command("clearqueue"))
 async def cmd_clearqueue(message: types.Message, state: FSMContext):
     cid = await require_chat(message, state)
-    if not cid: return
+    if not cid:
+        return
     count = await queue_col.count_documents({"chat_id": cid})
     if count == 0:
         await message.answer("📭 Queue already empty.")
         return
     await queue_col.delete_many({"chat_id": cid})
-    await message.answer(f"🗑 Cleared <b>{count}</b> pending requests (rejected).")
+    await message.answer(f"🗑 Cleared <b>{count}</b> pending requests.")
+
 
 @dp.message(Command("approved"))
 async def cmd_approved(message: types.Message, command: CommandObject, state: FSMContext):
     cid = await require_chat(message, state)
-    if not cid: return
+    if not cid:
+        return
     if command.args:
         try:
             val = int(command.args.strip())
@@ -617,14 +664,17 @@ async def cmd_approved(message: types.Message, command: CommandObject, state: FS
         return
     asyncio.create_task(process_queue_clearance(message, cid))
 
-# ──────────────────────────────────────────
+
+# ──────────────────────────────────────────────
 # HIGH-SPEED QUEUE CLEARANCE
-# ──────────────────────────────────────────
-async def process_single_approval(doc: dict, chat_id: int, ch_data: dict, sem: asyncio.Semaphore, results: dict):
+# ──────────────────────────────────────────────
+async def process_single_approval(
+    doc: dict, chat_id: int, ch_data: dict, sem: asyncio.Semaphore, results: dict
+):
     async with sem:
         uid = doc["user_id"]
         fname = doc.get("first_name", "User")
-        # 1. Approve first
+
         try:
             await bot.approve_chat_join_request(chat_id=chat_id, user_id=uid)
         except Exception as e:
@@ -633,30 +683,38 @@ async def process_single_approval(doc: dict, chat_id: int, ch_data: dict, sem: a
             results["errors"][err] = results["errors"].get(err, 0) + 1
             await queue_col.delete_one({"_id": doc["_id"]})
             return
-        # 2. Send welcome DM (isolated)
+
         try:
             welcome = ch_data.get("welcome_message", "")
             if welcome:
                 chat_title = ch_data.get("title", "")
                 count = ch_data.get("accepted_count", 0) + results["success"] + 1
                 text = render_template(
-                    welcome, name=fname, fullname=fname,
-                    username="N/A", userid=uid,
-                    chat=chat_title, chatid=chat_id,
-                    count=count, date=datetime.now().strftime("%Y-%m-%d"),
+                    welcome,
+                    name=fname,
+                    fullname=fname,
+                    username="N/A",
+                    userid=uid,
+                    chat=chat_title,
+                    chatid=chat_id,
+                    count=count,
+                    date=datetime.now().strftime("%Y-%m-%d"),
                 )
             else:
                 text = default_welcome_text(fname)
             await bot.send_message(chat_id=uid, text=text, reply_markup=default_welcome_kb())
         except Exception:
-            pass  # DM failure is isolated
-        # 3. DB updates
+            pass
+
         try:
             await asyncio.gather(
                 queue_col.delete_one({"_id": doc["_id"]}),
                 users_col.update_one(
                     {"_id": uid},
-                    {"$set": {"first_name": fname, "last_seen": datetime.utcnow()}, "$addToSet": {"joined_chats": chat_id}},
+                    {
+                        "$set": {"first_name": fname, "last_seen": datetime.utcnow()},
+                        "$addToSet": {"joined_chats": chat_id},
+                    },
                     upsert=True,
                 ),
             )
@@ -665,11 +723,12 @@ async def process_single_approval(doc: dict, chat_id: int, ch_data: dict, sem: a
             pass
         await asyncio.sleep(0.05)
 
+
 async def process_queue_clearance(message: types.Message, chat_id: int):
-    # Also reject expired requests first
     ch_data = await channels_col.find_one({"_id": chat_id})
     expiry = ch_data.get("expiry_hours", 0) if ch_data else 0
     expired_count = 0
+
     if expiry > 0:
         cutoff = datetime.utcnow() - timedelta(hours=expiry)
         expired = await queue_col.find({"chat_id": chat_id, "queued_at": {"$lt": cutoff}}).to_list(length=None)
@@ -679,7 +738,7 @@ async def process_queue_clearance(message: types.Message, chat_id: int):
             except Exception:
                 pass
             await queue_col.delete_one({"_id": ex["_id"]})
-        expired_count = len(expired)
+        expired_count = len(expired) if expired else 0
 
     pending = await queue_col.find({"chat_id": chat_id}).to_list(length=None)
     if not pending and expired_count == 0:
@@ -697,24 +756,27 @@ async def process_queue_clearance(message: types.Message, chat_id: int):
         f"✅ <b>Queue Cleared!</b>\n\n"
         f"🎯 Approved: <b>{results['success']}</b>\n"
         f"❌ Failed: <b>{results['fail']}</b>\n"
-        f"⏱ Expired & Rejected: <b>{expired_count}</b>\n"
+        f"⏱ Expired: <b>{expired_count}</b>\n"
     )
     if results["errors"]:
         report += "\n🛑 <b>Errors:</b>\n"
-        for err, cnt in results["errors"].items():
+        for err, cnt in list(results["errors"].items())[:5]:
             report += f"• <code>{err[:80]}</code> ({cnt}x)\n"
     await message.answer(report)
 
-# ──────────────────────────────────────────
+
+# ──────────────────────────────────────────────
 # 7. BROADCAST
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 @dp.message(Command("broadcast"))
 async def cmd_broadcast(message: types.Message, state: FSMContext):
     cid = await require_chat(message, state)
-    if not cid: return
+    if not cid:
+        return
     await state.update_data(broadcast_target=cid)
     await message.answer("📢 Send the message to broadcast (supports media via copy):")
     await state.set_state(S.broadcast)
+
 
 @dp.message(Command("broadcast_all"))
 async def cmd_broadcast_all(message: types.Message, state: FSMContext):
@@ -724,6 +786,7 @@ async def cmd_broadcast_all(message: types.Message, state: FSMContext):
     await state.update_data(broadcast_target="ALL")
     await message.answer("📢 <b>[GLOBAL]</b> Send the message to broadcast to ALL users:")
     await state.set_state(S.broadcast)
+
 
 @dp.message(S.broadcast)
 async def proc_broadcast(message: types.Message, state: FSMContext):
@@ -758,15 +821,19 @@ async def proc_broadcast(message: types.Message, state: FSMContext):
             await asyncio.sleep(0.05)
         except Exception:
             fail += 1
-    await status_msg.edit_text(f"✅ <b>Broadcast Done!</b>\n\n🎯 Delivered: {ok}\n❌ Failed: {fail}\n📊 Total: {total}")
+    await status_msg.edit_text(
+        f"✅ <b>Broadcast Done!</b>\n\n🎯 Delivered: {ok}\n❌ Failed: {fail}\n📊 Total: {total}"
+    )
 
-# ──────────────────────────────────────────
+
+# ──────────────────────────────────────────────
 # 8. STATISTICS & EXPORT
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 @dp.message(Command("stats"))
 async def cmd_stats(message: types.Message, state: FSMContext):
     cid = await require_chat(message, state)
-    if not cid: return
+    if not cid:
+        return
     ch = await channels_col.find_one({"_id": cid})
     if not ch:
         await message.answer("⚠️ Channel not found in DB.")
@@ -774,18 +841,19 @@ async def cmd_stats(message: types.Message, state: FSMContext):
     pending = await queue_col.count_documents({"chat_id": cid})
     total_members = await users_col.count_documents({"joined_chats": cid})
     txt = (
-        f"📊 <b>Statistics — {ch.get('title','?')}</b>\n\n"
+        f"📊 <b>Statistics — {ch.get('title', '?')}</b>\n\n"
         f"🆔 ID: <code>{cid}</code>\n"
         f"⚙️ Active: {'🟢 Yes' if ch.get('is_active') else '🔴 No'}\n"
-        f"👥 Accepted: <b>{ch.get('accepted_count',0)}</b> / {limit_display(ch.get('limit',0))}\n"
+        f"👥 Accepted: <b>{ch.get('accepted_count', 0)}</b> / {limit_display(ch.get('limit', 0))}\n"
         f"⏳ In Queue: <b>{pending}</b>\n"
         f"📦 Total in DB: <b>{total_members}</b>\n"
-        f"🔗 Force-Sub: <code>{ch.get('force_sub',0)}</code>\n"
-        f"📋 Log Channel: <code>{ch.get('log_channel',0)}</code>\n"
-        f"⏱ Expiry: <b>{ch.get('expiry_hours',0)}h</b>\n"
-        f"👤 Admins: <b>{len(ch.get('admins',[]))}</b>\n"
+        f"🔗 Force-Sub: <code>{ch.get('force_sub', 0)}</code>\n"
+        f"📋 Log Channel: <code>{ch.get('log_channel', 0)}</code>\n"
+        f"⏱ Expiry: <b>{ch.get('expiry_hours', 0)}h</b>\n"
+        f"👤 Admins: <b>{len(ch.get('admins', []))}</b>\n"
     )
     await message.answer(txt)
+
 
 @dp.message(Command("groupstats"))
 async def cmd_groupstats(message: types.Message):
@@ -801,17 +869,21 @@ async def cmd_groupstats(message: types.Message):
         pending = await queue_col.count_documents({"chat_id": c["_id"]})
         icon = "🟢" if c.get("is_active") else "🔴"
         txt += (
-            f"{icon} <b>{c.get('title','?')}</b> (<code>{c['_id']}</code>)\n"
-            f"   👥 {c.get('accepted_count',0)}/{limit_display(c.get('limit',0))} | ⏳ {pending}\n\n"
+            f"{icon} <b>{c.get('title', '?')}</b> (<code>{c['_id']}</code>)\n"
+            f"   👥 {c.get('accepted_count', 0)}/{limit_display(c.get('limit', 0))} | ⏳ {pending}\n\n"
         )
-    for chunk in [txt[i:i+4000] for i in range(0, len(txt), 4000)]:
+    for chunk in [txt[i : i + 4000] for i in range(0, len(txt), 4000)]:
         await message.answer(chunk)
+
 
 @dp.message(Command("export"))
 async def cmd_export(message: types.Message, state: FSMContext):
     cid = await require_chat(message, state)
-    if not cid: return
-    users = await users_col.find({"joined_chats": cid}, {"_id": 1, "first_name": 1, "last_seen": 1}).to_list(length=None)
+    if not cid:
+        return
+    users = await users_col.find({"joined_chats": cid}, {"_id": 1, "first_name": 1, "last_seen": 1}).to_list(
+        length=None
+    )
     if not users:
         await message.answer("⚠️ No users to export.")
         return
@@ -821,22 +893,22 @@ async def cmd_export(message: types.Message, state: FSMContext):
         if "last_seen" in u:
             entry["last_seen"] = u["last_seen"].isoformat()
         data.append(entry)
-    # Send as JSON document
     json_str = json.dumps(data, indent=2)
     filename = f"export_{cid}_{int(time.time())}.json"
-    # Write to temp file and send
-    import tempfile
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+    tmp_path = os.path.join(tempfile.gettempdir(), filename)
+    with open(tmp_path, "w") as f:
         f.write(json_str)
-        f.flush()
-        from aiogram.types import FSInputFile
-        doc = FSInputFile(f.name, filename=filename)
-        await message.answer_document(doc, caption=f"📊 Export: <b>{len(data)}</b> users from <code>{cid}</code>")
-    os.unlink(f.name)
+    try:
+        doc = FSInputFile(tmp_path, filename=filename)
+        await message.answer_document(doc, caption=f"📊 <b>{len(data)}</b> users from <code>{cid}</code>")
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
-# ──────────────────────────────────────────
+
+# ──────────────────────────────────────────────
 # 9. OWNER-ONLY UTILITIES
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 @dp.message(Command("dropdb"))
 async def cmd_dropdb(message: types.Message):
     if not is_owner(message.from_user.id):
@@ -847,27 +919,30 @@ async def cmd_dropdb(message: types.Message):
     await queue_col.drop()
     await blacklist_col.drop()
     await logs_col.drop()
-    await message.answer("🗑 <b>ALL DATA WIPED.</b> Use with caution.")
+    await message.answer("🗑 <b>ALL DATA WIPED.</b>")
 
-# ──────────────────────────────────────────
+
+# ──────────────────────────────────────────────
 # 10. JOIN REQUEST HANDLER — THE CORE
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 async def process_live_approval(chat_id: int, user_id: int, first_name: str, ch_data: dict):
-    """Approve a live user instantly. DM failure never blocks approval."""
-    # 1. Approve
     try:
         await bot.approve_chat_join_request(chat_id=chat_id, user_id=user_id)
     except Exception as e:
         logger.warning(f"Approve failed for {user_id} in {chat_id}: {e}")
         return
-    # 2. Welcome DM
+
     try:
         welcome = ch_data.get("welcome_message", "")
         if welcome:
             text = render_template(
-                welcome, name=first_name, fullname=first_name,
-                username="N/A", userid=user_id,
-                chat=ch_data.get("title", ""), chatid=chat_id,
+                welcome,
+                name=first_name,
+                fullname=first_name,
+                username="N/A",
+                userid=user_id,
+                chat=ch_data.get("title", ""),
+                chatid=chat_id,
                 count=ch_data.get("accepted_count", 0) + 1,
                 date=datetime.now().strftime("%Y-%m-%d"),
             )
@@ -875,20 +950,23 @@ async def process_live_approval(chat_id: int, user_id: int, first_name: str, ch_
             text = default_welcome_text(first_name)
         await bot.send_message(chat_id=user_id, text=text, reply_markup=default_welcome_kb())
     except Exception:
-        pass  # Isolated — user might not have started the bot
-    # 3. DB updates
+        pass
+
     try:
         await asyncio.gather(
             users_col.update_one(
                 {"_id": user_id},
-                {"$set": {"first_name": first_name, "last_seen": datetime.utcnow()}, "$addToSet": {"joined_chats": chat_id}},
+                {
+                    "$set": {"first_name": first_name, "last_seen": datetime.utcnow()},
+                    "$addToSet": {"joined_chats": chat_id},
+                },
                 upsert=True,
             ),
             channels_col.update_one({"_id": chat_id}, {"$inc": {"accepted_count": 1}}, upsert=True),
         )
     except Exception as e:
         logger.warning(f"DB update failed for {user_id}: {e}")
-    # 4. Audit log
+
     await log_event(chat_id, "AUTO_APPROVE", user_id, first_name)
 
 
@@ -899,7 +977,6 @@ async def handle_join_request(update: types.ChatJoinRequest):
     first_name = user.first_name
     user_id = user.id
 
-    # 1. Blacklist check
     if await is_blacklisted(user_id):
         try:
             await bot.decline_chat_join_request(chat_id=chat_id, user_id=user_id)
@@ -908,9 +985,7 @@ async def handle_join_request(update: types.ChatJoinRequest):
         await log_event(chat_id, "REJECT_BLACKLIST", user_id, first_name)
         return
 
-    # 2. Get or create channel config
     ch_data = await get_or_create_channel(chat_id)
-    # Update title if we have it from the update
     if update.chat.title and ch_data.get("title") != update.chat.title:
         await channels_col.update_one({"_id": chat_id}, {"$set": {"title": update.chat.title}})
 
@@ -918,20 +993,18 @@ async def handle_join_request(update: types.ChatJoinRequest):
     limit = ch_data.get("limit", 0)
     count = ch_data.get("accepted_count", 0)
 
-    # 3. Force-subscribe check
     force_sub = ch_data.get("force_sub", 0)
     if force_sub:
         try:
             member = await bot.get_chat_member(chat_id=force_sub, user_id=user_id)
             if member.status not in ("member", "administrator", "creator"):
-                # Not in required channel — notify
                 try:
                     fs_chat = await bot.get_chat(force_sub)
                     fs_title = fs_chat.title or "Required Channel"
                     fs_username = fs_chat.username
                     await bot.send_message(
                         chat_id=user_id,
-                        text=f"⚠️ <b>{first_name}</b>, you must join <b>{fs_title}</b> first before I can approve your request.",
+                        text=f"⚠️ <b>{first_name}</b>, you must join <b>{fs_title}</b> first.",
                         reply_markup=force_sub_kb(fs_title, fs_username, force_sub),
                     )
                 except Exception:
@@ -939,32 +1012,28 @@ async def handle_join_request(update: types.ChatJoinRequest):
                 await log_event(chat_id, "FORCE_SUB_BLOCK", user_id, first_name)
                 return
         except Exception:
-            pass  # If we can't check, proceed
+            pass
 
-    # 4. Check auto-reject expiry for existing queued users (cleanup)
     expiry = ch_data.get("expiry_hours", 0)
     if expiry > 0:
         cutoff = datetime.utcnow() - timedelta(hours=expiry)
-        expired = await queue_col.find({"chat_id": chat_id, "queued_at": {"$lt": cutoff}}).to_list(length=100)
-        for ex in expired:
+        expired_docs = await queue_col.find({"chat_id": chat_id, "queued_at": {"$lt": cutoff}}).to_list(length=100)
+        for ex in expired_docs:
             try:
                 await bot.decline_chat_join_request(chat_id=chat_id, user_id=ex["user_id"])
             except Exception:
                 pass
             await queue_col.delete_one({"_id": ex["_id"]})
 
-    # 5. Auto-accept or Queue
     if is_active and (limit == 0 or count < limit):
-        # LIVE APPROVAL
         asyncio.create_task(process_live_approval(chat_id, user_id, first_name, ch_data))
     else:
-        # QUEUE MODE
         chat_title = ch_data.get("title", "our channel")
         wait_text = (
             f"⏳ Hello <b>{first_name}</b>!\n\n"
             f"Your request to join <b>{chat_title}</b> has been received.\n"
             f"You're now in the <b>Waiting Room</b>.\n\n"
-            f"👇 Click the button below to confirm your spot!"
+            f"👇 Click below to confirm your spot!"
         )
         try:
             await bot.send_message(
@@ -981,12 +1050,12 @@ async def handle_join_request(update: types.ChatJoinRequest):
         )
         await log_event(chat_id, "QUEUED", user_id, first_name)
 
-# ──────────────────────────────────────────
+
+# ──────────────────────────────────────────────
 # 11. CALLBACK QUERY HANDLERS
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 @dp.callback_query(ConfirmCb.filter())
 async def cb_confirm_spot(callback: CallbackQuery, callback_data: ConfirmCb):
-    """User confirms their queue spot."""
     cid = callback_data.cid
     uid = callback_data.uid
 
@@ -994,28 +1063,23 @@ async def cb_confirm_spot(callback: CallbackQuery, callback_data: ConfirmCb):
         await callback.answer("❌ This isn't your button.", show_alert=True)
         return
 
-    await queue_col.update_one(
-        {"chat_id": cid, "user_id": uid},
-        {"$set": {"confirmed": True}},
-    )
+    await queue_col.update_one({"chat_id": cid, "user_id": uid}, {"$set": {"confirmed": True}})
     await callback.message.edit_text(
-        callback.message.text + "\n\n✅ <b>Spot confirmed!</b> You'll be approved when an admin processes the queue."
+        callback.message.text + "\n\n✅ <b>Spot confirmed!</b> You'll be approved when admin processes the queue."
     )
     await callback.answer("✅ Confirmed!")
 
-# ──────────────────────────────────────────
+
+# ──────────────────────────────────────────────
 # 12. HEALTH CHECK & WEB ENDPOINTS
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 async def health_check(request: web.Request) -> web.Response:
-    """Render-compatible health check endpoint."""
     checks = {"bot": False, "db": False}
-    # Check bot
     try:
-        me = await bot.get_me()
+        await bot.get_me()
         checks["bot"] = True
     except Exception:
         pass
-    # Check DB
     try:
         await mongo_client.admin.command("ping")
         checks["db"] = True
@@ -1024,21 +1088,27 @@ async def health_check(request: web.Request) -> web.Response:
     status = 200 if all(checks.values()) else 503
     return web.json_response({"status": "ok" if status == 200 else "degraded", "checks": checks}, status=status)
 
+
 async def root_info(request: web.Request) -> web.Response:
-    """Root endpoint showing bot info."""
     try:
         me = await bot.get_me()
         return web.json_response({"bot": me.username, "engine": "AutoAccept Pro", "mode": "webhook"})
     except Exception:
         return web.json_response({"engine": "AutoAccept Pro", "status": "starting"})
 
-# ──────────────────────────────────────────
+
+# ──────────────────────────────────────────────
 # 13. WEBHOOK LIFECYCLE
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 async def on_startup(bot: Bot):
     webhook_url = f"{BASE_URL}{WEBHOOK_PATH}"
-    await bot.set_webhook(url=webhook_url, drop_pending_updates=True, allowed_updates=["message", "callback_query", "chat_join_request"])
+    await bot.set_webhook(
+        url=webhook_url,
+        drop_pending_updates=True,
+        allowed_updates=["message", "callback_query", "chat_join_request"],
+    )
     logger.info(f"✅ Webhook set: {webhook_url}")
+
 
 async def on_shutdown(bot: Bot):
     logger.info("🛑 Shutting down…")
@@ -1047,24 +1117,25 @@ async def on_shutdown(bot: Bot):
     mongo_client.close()
     logger.info("✅ Shutdown complete.")
 
-# ──────────────────────────────────────────
+
+# ──────────────────────────────────────────────
 # 14. MAIN
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────
 def main():
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
     app = web.Application()
-    # Custom HTTP endpoints
     app.router.add_get("/health", health_check)
     app.router.add_get("/", root_info)
-    # Webhook handler
+
     handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
     handler.register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
 
     logger.info(f"🚀 Starting on port {PORT}")
     web.run_app(app, host="0.0.0.0", port=PORT)
+
 
 if __name__ == "__main__":
     main()
