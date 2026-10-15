@@ -32,13 +32,13 @@ if not BOT_TOKEN or not MONGO_URI:
     raise ValueError("❌ FATAL: BOT_TOKEN or MONGO_URI is missing from environment variables!")
 
 if BOT_OWNER_ID == 0:
-    logging.warning("⚠️ BOT_OWNER_ID not set! All admin commands will be inaccessible.")
+    logging.warning("⚠️ BOT_OWNER_ID not set! Owner-only commands will be inaccessible.")
 
 # --- CONSTANTS ---
-BROADCAST_MAX = 10000          # Safety cap on broadcast recipients
-QUEUE_BATCH_SIZE = 50          # Users per batch in queue clearance
-BG_CONCURRENCY = 20            # Max concurrent background approvals
-BG_SLEEP = 0.05                # Delay between API calls to avoid flood
+BROADCAST_MAX = 10000
+QUEUE_BATCH_SIZE = 50
+BG_CONCURRENCY = 20
+BG_SLEEP = 0.05
 
 # --- MONGODB SETUP ---
 client = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=5000)
@@ -53,7 +53,6 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 
-# --- BACKGROUND TASK TRACKING (prevents GC) ---
 _background_tasks: set[asyncio.Task] = set()
 
 
@@ -61,7 +60,6 @@ _background_tasks: set[asyncio.Task] = set()
 # HELPER FUNCTIONS
 # ==========================================
 def escape_md(text: str) -> str:
-    """Escape Markdown v1 special characters in user-provided text."""
     if not text:
         return ""
     text = str(text)
@@ -70,16 +68,14 @@ def escape_md(text: str) -> str:
     return text
 
 
-async def is_authorized(message: types.Message) -> bool:
-    """Check if the user is the bot owner. Sends denial if not."""
+async def is_owner(message: types.Message) -> bool:
     if message.from_user.id != BOT_OWNER_ID:
-        await message.answer("⛔ You are not authorized to use this command.")
+        await message.answer("⛔ This command is restricted to the bot owner only.")
         return False
     return True
 
 
 async def verify_mongo():
-    """Verify MongoDB connection on startup."""
     try:
         await client.admin.command("ping")
         logging.info("MongoDB connected successfully.")
@@ -89,7 +85,6 @@ async def verify_mongo():
 
 
 async def send_long_message(chat_id: int, text: str, parse_mode: str = "Markdown"):
-    """Send a message, splitting on newlines if it exceeds Telegram's 4096 char limit."""
     if len(text) <= 4096:
         await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
         return
@@ -107,7 +102,6 @@ async def send_long_message(chat_id: int, text: str, parse_mode: str = "Markdown
 
 
 def create_background_task(coro) -> asyncio.Task:
-    """Create a tracked background task that won't be garbage collected."""
     task = asyncio.create_task(coro)
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
@@ -148,7 +142,6 @@ async def get_current_chat(message: types.Message, state: FSMContext):
 # RENDER KEEPALIVE & HEALTH
 # ==========================================
 async def keepalive_task():
-    """Pings the Render URL every 5 minutes to prevent free tier sleep."""
     if not RENDER_URL:
         return
     async with aiohttp.ClientSession() as session:
@@ -164,9 +157,7 @@ async def keepalive_task():
 @dp.startup()
 async def on_startup(bot: Bot):
     await verify_mongo()
-
     create_background_task(keepalive_task())
-
     webhook_url = f"{RENDER_URL}{WEBHOOK_PATH}"
     logging.info(f"Setting up webhook to: {webhook_url}")
     await bot.set_webhook(
@@ -191,8 +182,21 @@ async def cmd_start(message: types.Message):
 
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
+    is_bot_owner = message.from_user.id == BOT_OWNER_ID
+
+    owner_cmds = ""
+    if is_bot_owner:
+        owner_cmds = (
+            "\n\n🔐 **Owner Only:**\n"
+            "🔹 `/ban <id>` - Ban user from joining\n"
+            "🔹 `/unban <id>` - Unban user\n"
+            "🔹 `/broadcast_all` - Global broadcast\n"
+            "🔹 `/groupstats` - View all chats stats\n"
+            "🔹 `/listchats` - List all chat IDs\n"
+        )
+
     help_text = (
-        "⚙️ **Admin Commands:**\n"
+        "⚙️ **Commands:**\n"
         "🔹 `/connect <id>` - Link to a specific chat\n"
         "🔹 `/disconnect` - Unlink from current chat\n"
         "🔹 `/settings` - View settings of current chat\n"
@@ -200,7 +204,7 @@ async def cmd_help(message: types.Message):
         "🔹 `/welcome` - Set custom welcome DM text\n"
         "🔹 `/approve_on` - Turn auto-accept ON\n"
         "🔹 `/approve_off` - Turn OFF (Routes users to Queue)\n"
-        "🔹 `/approved` - Accept all users currently in the Queue\n"
+        "🔹 `/approved` - Accept all users in the Queue\n"
         "🔹 `/approved <number>` - Set the accept limit directly\n"
         "🔹 `/pending` - Check users waiting in queue\n"
         "🔹 `/cleanup` - Clear queue for current chat\n"
@@ -208,12 +212,9 @@ async def cmd_help(message: types.Message):
         "🔹 `/broadcast` - Broadcast to accepted members\n"
         "🔹 `/broadcast_pending` - Broadcast to queue members\n"
         "🔹 `/stats` - View today's approval stats\n"
-        "🔹 `/ban <id>` - Ban user from joining\n"
-        "🔹 `/unban <id>` - Unban user\n"
         "🔹 `/ping` - Check bot & DB latency\n"
-        "🔹 `/groupstats` - View all chats (Owner Only)\n"
-        "🔹 `/listchats` - List all chat IDs (Owner Only)\n"
         "🔹 `/cancel` - Cancel current operation\n"
+        f"{owner_cmds}"
     )
     await message.answer(help_text, parse_mode="Markdown")
 
@@ -230,11 +231,7 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
 
 @dp.message(Command("ping"))
 async def cmd_ping(message: types.Message):
-    if not await is_authorized(message):
-        return
-
     import time
-
     start = time.time()
     test_msg = await message.answer("Pinging...")
     end = time.time()
@@ -254,7 +251,7 @@ async def cmd_ping(message: types.Message):
 
 @dp.message(Command("listchats"))
 async def cmd_listchats(message: types.Message):
-    if not await is_authorized(message):
+    if not await is_owner(message):
         return
 
     text = "📋 **Connected Chats:**\n"
@@ -272,7 +269,7 @@ async def cmd_listchats(message: types.Message):
 
 @dp.message(Command("groupstats"))
 async def cmd_groupstats(message: types.Message):
-    if not await is_authorized(message):
+    if not await is_owner(message):
         return
 
     total, active = 0, 0
@@ -293,13 +290,10 @@ async def cmd_groupstats(message: types.Message):
 
 
 # ==========================================
-# CONNECTION & SETTINGS MANAGEMENT
+# CONNECTION & SETTINGS MANAGEMENT (PUBLIC)
 # ==========================================
 @dp.message(Command("connect"))
 async def cmd_connect(message: types.Message, command: CommandObject, state: FSMContext):
-    if not await is_authorized(message):
-        return
-
     if not command.args:
         await message.answer(
             "⚠️ Please provide a valid target Chat ID.\nExample: `/connect -1001234567890`"
@@ -313,19 +307,10 @@ async def cmd_connect(message: types.Message, command: CommandObject, state: FSM
         return
 
     try:
-        # Verify bot is admin
         bot_member = await bot.get_chat_member(chat_id=chat_id, user_id=bot.id)
         if bot_member.status not in ["administrator", "creator"]:
             await message.answer(
                 "⚠️ Bot is not an administrator in that chat. Please add me as an admin first!"
-            )
-            return
-
-        # Verify calling user is admin of the target chat
-        user_member = await bot.get_chat_member(chat_id=chat_id, user_id=message.from_user.id)
-        if user_member.status not in ["administrator", "creator"]:
-            await message.answer(
-                "⚠️ You must be an administrator in that chat to connect me to it."
             )
             return
 
@@ -358,9 +343,6 @@ async def cmd_connect(message: types.Message, command: CommandObject, state: FSM
 
 @dp.message(Command("disconnect"))
 async def cmd_disconnect(message: types.Message, state: FSMContext):
-    if not await is_authorized(message):
-        return
-
     data = await state.get_data()
     chat_id = data.get("connected_chat_id")
     if not chat_id:
@@ -368,16 +350,13 @@ async def cmd_disconnect(message: types.Message, state: FSMContext):
         return
     await state.clear()
     await message.answer(
-        f"✅ Disconnected from `{chat_id}`. Bot will no longer manage this chat from this admin panel.",
+        f"✅ Disconnected from `{chat_id}`.",
         parse_mode="Markdown",
     )
 
 
 @dp.message(Command("settings"))
 async def cmd_settings(message: types.Message, state: FSMContext):
-    if not await is_authorized(message):
-        return
-
     chat_id = await get_current_chat(message, state)
     if not chat_id:
         return
@@ -400,17 +379,13 @@ async def cmd_settings(message: types.Message, state: FSMContext):
 
 
 # ==========================================
-# QUEUE & STATS COMMANDS
+# QUEUE & STATS COMMANDS (PUBLIC)
 # ==========================================
 @dp.message(Command("pending"))
 async def cmd_pending(message: types.Message, state: FSMContext):
-    if not await is_authorized(message):
-        return
-
     chat_id = await get_current_chat(message, state)
     if not chat_id:
         return
-
     count = await pending_collection.count_documents({"chat_id": chat_id})
     await message.answer(
         f"⏳ There are **{count}** users waiting in the queue for this chat.",
@@ -420,35 +395,24 @@ async def cmd_pending(message: types.Message, state: FSMContext):
 
 @dp.message(Command("cleanup"))
 async def cmd_cleanup(message: types.Message, state: FSMContext):
-    if not await is_authorized(message):
-        return
-
     chat_id = await get_current_chat(message, state)
     if not chat_id:
         return
-
     res = await pending_collection.delete_many({"chat_id": chat_id})
     await message.answer(f"🧹 Cleared **{res.deleted_count}** users from the queue.")
 
 
 @dp.message(Command("resetcount"))
 async def cmd_resetcount(message: types.Message, state: FSMContext):
-    if not await is_authorized(message):
-        return
-
     chat_id = await get_current_chat(message, state)
     if not chat_id:
         return
-
     await channels_collection.update_one({"_id": chat_id}, {"$set": {"accepted_count": 0}})
     await message.answer("✅ Accepted users counter reset to 0.")
 
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: types.Message):
-    if not await is_authorized(message):
-        return
-
     today = datetime.now().strftime("%Y-%m-%d")
     doc = await stats_collection.find_one({"_id": today})
     if not doc:
@@ -467,11 +431,11 @@ async def cmd_stats(message: types.Message):
 
 
 # ==========================================
-# BAN / UNBAN LOGIC
+# BAN / UNBAN LOGIC (OWNER ONLY)
 # ==========================================
 @dp.message(Command("ban"))
 async def cmd_ban(message: types.Message, command: CommandObject):
-    if not await is_authorized(message):
+    if not await is_owner(message):
         return
 
     if not command.args:
@@ -492,7 +456,7 @@ async def cmd_ban(message: types.Message, command: CommandObject):
 
 @dp.message(Command("unban"))
 async def cmd_unban(message: types.Message, command: CommandObject):
-    if not await is_authorized(message):
+    if not await is_owner(message):
         return
 
     if not command.args:
@@ -514,13 +478,9 @@ async def cmd_unban(message: types.Message, command: CommandObject):
 # ==========================================
 @dp.message(Command("approve_on"))
 async def cmd_approve_on(message: types.Message, state: FSMContext):
-    if not await is_authorized(message):
-        return
-
     chat_id = await get_current_chat(message, state)
     if not chat_id:
         return
-
     await channels_collection.update_one(
         {"_id": chat_id}, {"$set": {"is_active": True}}, upsert=True
     )
@@ -529,13 +489,9 @@ async def cmd_approve_on(message: types.Message, state: FSMContext):
 
 @dp.message(Command("approve_off"))
 async def cmd_approve_off(message: types.Message, state: FSMContext):
-    if not await is_authorized(message):
-        return
-
     chat_id = await get_current_chat(message, state)
     if not chat_id:
         return
-
     await channels_collection.update_one(
         {"_id": chat_id}, {"$set": {"is_active": False}}, upsert=True
     )
@@ -544,13 +500,9 @@ async def cmd_approve_off(message: types.Message, state: FSMContext):
 
 @dp.message(Command("setlimit"))
 async def cmd_setlimit(message: types.Message, state: FSMContext):
-    if not await is_authorized(message):
-        return
-
     chat_id = await get_current_chat(message, state)
     if not chat_id:
         return
-
     await message.answer(
         "🔢 Reply with the maximum number of members to auto-accept (send 0 for infinite):"
     )
@@ -559,7 +511,6 @@ async def cmd_setlimit(message: types.Message, state: FSMContext):
 
 @dp.message(BotConfigState.waiting_for_number)
 async def process_limit_number(message: types.Message, state: FSMContext):
-    # Allow cancel
     if message.text and message.text.startswith("/cancel"):
         await state.set_state(None)
         await message.answer("❌ Operation cancelled.")
@@ -570,7 +521,7 @@ async def process_limit_number(message: types.Message, state: FSMContext):
         if new_limit < 0:
             raise ValueError
         if new_limit == 0:
-            new_limit = None  # Infinity
+            new_limit = None
     except ValueError:
         await message.answer("⚠️ Please enter a valid non-negative number (0 = infinite).")
         return
@@ -590,9 +541,6 @@ async def process_limit_number(message: types.Message, state: FSMContext):
 
 @dp.message(Command("welcome"))
 async def cmd_welcome(message: types.Message, state: FSMContext):
-    if not await is_authorized(message):
-        return
-
     chat_id = await get_current_chat(message, state)
     if not chat_id:
         return
@@ -633,41 +581,28 @@ async def process_welcome_text(message: types.Message, state: FSMContext):
 
 @dp.message(Command("broadcast"))
 async def cmd_broadcast(message: types.Message, state: FSMContext):
-    if not await is_authorized(message):
-        return
-
     chat_id = await get_current_chat(message, state)
     if not chat_id:
         return
-
-    await message.answer(
-        f"📢 Send the message to broadcast to accepted members of `{chat_id}`:"
-    )
+    await message.answer(f"📢 Send the message to broadcast to accepted members of `{chat_id}`:")
     await state.update_data(broadcast_target=chat_id, broadcast_type="accepted")
     await state.set_state(BotConfigState.waiting_for_broadcast)
 
 
 @dp.message(Command("broadcast_pending"))
 async def cmd_broadcast_pending(message: types.Message, state: FSMContext):
-    if not await is_authorized(message):
-        return
-
     chat_id = await get_current_chat(message, state)
     if not chat_id:
         return
-
-    await message.answer(
-        f"📢 Send the message to broadcast to PENDING members of `{chat_id}`:"
-    )
+    await message.answer(f"📢 Send the message to broadcast to PENDING members of `{chat_id}`:")
     await state.update_data(broadcast_target=chat_id, broadcast_type="pending")
     await state.set_state(BotConfigState.waiting_for_broadcast)
 
 
 @dp.message(Command("broadcast_all"))
 async def cmd_broadcast_all(message: types.Message, state: FSMContext):
-    if not await is_authorized(message):
+    if not await is_owner(message):
         return
-
     await message.answer("⚠️ **[GLOBAL BROADCAST]** Send message to ALL accepted users:")
     await state.update_data(broadcast_target="ALL", broadcast_type="accepted")
     await state.set_state(BotConfigState.waiting_for_broadcast)
@@ -685,21 +620,20 @@ async def process_broadcast(message: types.Message, state: FSMContext):
     b_type = data.get("broadcast_type")
     await state.set_state(None)
 
-    # Build the query and cursor
     if target == "ALL":
         query = {}
         cursor = users_collection.find({}, {"_id": 1})
+        count_collection = users_collection
     elif b_type == "pending":
         query = {"chat_id": target}
         cursor = pending_collection.find({"chat_id": target}, {"user_id": 1, "_id": 0})
+        count_collection = pending_collection
     else:
         query = {"joined_chats": target}
         cursor = users_collection.find({"joined_chats": target}, {"_id": 1})
+        count_collection = users_collection
 
-    # Estimate total for safety check
-    total_estimated = await (pending_collection if b_type == "pending" and target != "ALL" else users_collection).count_documents(
-        query
-    )
+    total_estimated = await count_collection.count_documents(query)
 
     if total_estimated == 0:
         await message.answer("⚠️ Found 0 users for this broadcast.")
@@ -707,8 +641,7 @@ async def process_broadcast(message: types.Message, state: FSMContext):
 
     if total_estimated > BROADCAST_MAX:
         await message.answer(
-            f"⚠️ Too many recipients ({total_estimated}). Safety cap is {BROADCAST_MAX}. "
-            f"Use `/broadcast_all` in smaller segments or raise BROADCAST_MAX."
+            f"⚠️ Too many recipients ({total_estimated}). Safety cap is {BROADCAST_MAX}."
         )
         return
 
@@ -740,7 +673,6 @@ async def process_broadcast(message: types.Message, state: FSMContext):
             except Exception:
                 fail_count += 1
         except TelegramForbiddenError:
-            # User blocked the bot
             await users_collection.update_one({"_id": int(user_id)}, {"$set": {"active": False}})
             fail_count += 1
         except Exception:
@@ -762,7 +694,6 @@ async def process_single_pending_user(
         user_id = user_doc["user_id"]
         first_name = user_doc.get("first_name", "User")
 
-        # Check ban (find_one is more efficient than count_documents)
         banned = await banned_collection.find_one({"_id": user_id})
         if banned:
             results["fail"] += 1
@@ -791,7 +722,7 @@ async def process_single_pending_user(
                 reply_markup=get_suggestion_keyboard(),
             )
         except Exception:
-            pass  # Welcome DM failed, but approval succeeded
+            pass
 
         try:
             await pending_collection.delete_one({"_id": user_doc["_id"]})
@@ -816,10 +747,9 @@ async def process_single_pending_user(
 
 
 async def process_queue_clearance(message: types.Message, chat_id: int):
-    """Process pending queue in batches to avoid memory issues."""
     channel_data = await channels_collection.find_one({"_id": chat_id})
-
     total_count = await pending_collection.count_documents({"chat_id": chat_id})
+
     if total_count == 0:
         await message.answer("📭 Queue is empty.")
         return
@@ -832,7 +762,6 @@ async def process_queue_clearance(message: types.Message, chat_id: int):
     results = {"success": 0, "fail": 0}
     semaphore = asyncio.Semaphore(BG_CONCURRENCY)
 
-    # Process in batches to avoid loading everything into memory
     skip = 0
     processed = 0
     while processed < total_count:
@@ -859,12 +788,7 @@ async def process_queue_clearance(message: types.Message, chat_id: int):
 
 
 @dp.message(Command("approved"))
-async def cmd_approved(
-    message: types.Message, command: CommandObject, state: FSMContext
-):
-    if not await is_authorized(message):
-        return
-
+async def cmd_approved(message: types.Message, command: CommandObject, state: FSMContext):
     chat_id = await get_current_chat(message, state)
     if not chat_id:
         return
@@ -889,24 +813,18 @@ async def cmd_approved(
 
 
 # ==========================================
-# LIVE JOIN REQUEST (with atomic limit check)
+# LIVE JOIN REQUEST
 # ==========================================
-async def process_live_user_background(
-    chat_id, user_id, first_name, welcome_text
-):
-    """Background task: approve join request, send welcome, update DB."""
+async def process_live_user_background(chat_id, user_id, first_name, welcome_text):
     try:
-        # Approve the join request
         await bot.approve_chat_join_request(chat_id=chat_id, user_id=user_id)
     except Exception as e:
         logging.warning(f"Failed to approve {user_id} in {chat_id}: {e}")
-        # Revert the count increment since approval failed
         await channels_collection.update_one(
             {"_id": chat_id}, {"$inc": {"accepted_count": -1}}
         )
         return
 
-    # Send welcome DM (non-critical, don't fail on error)
     try:
         await bot.send_message(
             chat_id=user_id,
@@ -916,7 +834,6 @@ async def process_live_user_background(
     except Exception:
         pass
 
-    # Update DB
     try:
         await asyncio.gather(
             users_collection.update_one(
@@ -943,7 +860,6 @@ async def handle_join_request(update: types.ChatJoinRequest):
     chat_id = update.chat.id
     first_name = update.from_user.first_name
 
-    # Check if user is banned
     banned = await banned_collection.find_one({"_id": user_id})
     if banned:
         try:
@@ -956,7 +872,6 @@ async def handle_join_request(update: types.ChatJoinRequest):
     is_bot_active = channel_data.get("is_active", True) if channel_data else True
     max_limit = channel_data.get("limit", None) if channel_data else None
 
-    # If bot is paused, route to pending queue
     if not is_bot_active:
         chat_title = (
             escape_md(channel_data.get("title", "our channel"))
@@ -980,14 +895,12 @@ async def handle_join_request(update: types.ChatJoinRequest):
         )
         return
 
-    # If there's a limit, use atomic check-and-increment to prevent race conditions
     if max_limit is not None:
         result = await channels_collection.find_one_and_update(
             {"_id": chat_id, "accepted_count": {"$lt": max_limit}},
             {"$inc": {"accepted_count": 1}},
         )
         if result is None:
-            # Limit reached — route to pending
             chat_title = (
                 escape_md(channel_data.get("title", "our channel"))
                 if channel_data
@@ -999,9 +912,7 @@ async def handle_join_request(update: types.ChatJoinRequest):
                 f"Click /start to confirm your spot!"
             )
             try:
-                await bot.send_message(
-                    chat_id=user_id, text=wait_text, parse_mode="Markdown"
-                )
+                await bot.send_message(chat_id=user_id, text=wait_text, parse_mode="Markdown")
             except Exception:
                 pass
 
@@ -1012,12 +923,10 @@ async def handle_join_request(update: types.ChatJoinRequest):
             )
             return
     else:
-        # No limit — just increment
         await channels_collection.update_one(
             {"_id": chat_id}, {"$inc": {"accepted_count": 1}}, upsert=True
         )
 
-    # Approve in background
     default_msg = f"Hello {first_name}! Your request to join was approved. Welcome! 🎉"
     welcome_text = (
         channel_data.get("welcome_message", default_msg)
@@ -1034,7 +943,6 @@ async def handle_join_request(update: types.ChatJoinRequest):
 # ==========================================
 @dp.shutdown()
 async def on_shutdown(bot: Bot):
-    """Cleanup on shutdown."""
     client.close()
     logging.info("MongoDB connection closed. Bot shut down.")
 
